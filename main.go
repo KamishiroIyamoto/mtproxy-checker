@@ -9,15 +9,16 @@ import (
 	"net"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/adrg/xdg"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/dcs"
+	"golang.org/x/term"
 )
 
 const (
@@ -26,22 +27,16 @@ const (
 )
 
 func downloadsDir() string {
-	if out, err := exec.Command("xdg-user-dir", "DOWNLOAD").Output(); err == nil {
-		if dir := strings.TrimSpace(string(out)); dir != "" {
-			if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
-				return dir
-			}
-
-			if dir != "" && dir != os.Getenv("HOME") {
-				return dir
-			}
+	if dir := xdg.UserDirs.Download; dir != "" {
+		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+			return dir
 		}
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "."
+
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, "Downloads")
 	}
-	return filepath.Join(home, "Downloads")
+	return "."
 }
 
 type proxyEntry struct {
@@ -65,7 +60,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	entries, _, err := readProxies(inputFile)
+	entries, err := readProxies(inputFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error reading %s: %v\n", inputFile, err)
 		os.Exit(1)
@@ -80,12 +75,17 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error opening %s: %v\n", outputFile, err)
 		os.Exit(1)
 	}
-	defer out.Close()
+
+	defer func() {
+		if cerr := out.Close(); cerr != nil {
+			fmt.Fprintf(os.Stderr, "Error closing %s: %v\n", outputFile, cerr)
+		}
+	}()
 
 	total := len(entries)
 	var processed, working int64
-
 	done := make(chan struct{})
+
 	var progressWG sync.WaitGroup
 	progressWG.Add(1)
 	go func() {
@@ -120,7 +120,6 @@ func main() {
 	}()
 
 	writer := bufio.NewWriter(out)
-	defer writer.Flush()
 
 	var availableList []string
 	for r := range results {
@@ -128,8 +127,15 @@ func main() {
 		if r.ok {
 			atomic.AddInt64(&working, 1)
 			availableList = append(availableList, r.entry.raw)
-			writer.WriteString(r.entry.raw + "\n")
+
+			if _, werr := writer.WriteString(r.entry.raw + "\n"); werr != nil {
+				fmt.Fprintf(os.Stderr, "Error writing output: %v\n", werr)
+			}
 		}
+	}
+
+	if err := writer.Flush(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error flushing output: %v\n", err)
 	}
 
 	close(done)
@@ -142,7 +148,7 @@ func main() {
 }
 
 func renderProgress(total int, processed, working *int64, done <-chan struct{}) {
-	if !isTTY(os.Stderr) {
+	if !term.IsTerminal(int(os.Stderr.Fd())) {
 		<-done
 		return
 	}
@@ -161,28 +167,23 @@ func renderProgress(total int, processed, working *int64, done <-chan struct{}) 
 			p := atomic.LoadInt64(processed)
 			w := atomic.LoadInt64(working)
 			remaining := int64(total) - p
-			fmt.Fprintf(os.Stderr,
-				"\r\033[K%c Checked: %d/%d | Working: %d | Remaining: %d",
+			fmt.Fprintf(os.Stderr, "\r\033[K%c Checked: %d/%d | Working: %d | Remaining: %d",
 				frames[i%len(frames)], p, total, w, remaining)
 			i++
 		}
 	}
 }
 
-func isTTY(f *os.File) bool {
-	fi, err := f.Stat()
-	if err != nil {
-		return false
-	}
-	return fi.Mode()&os.ModeCharDevice != 0
-}
-
-func readProxies(path string) (entries []proxyEntry, skipped int, err error) {
+func readProxies(path string) (entries []proxyEntry, err error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	defer f.Close()
+	defer func() {
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
@@ -192,7 +193,6 @@ func readProxies(path string) (entries []proxyEntry, skipped int, err error) {
 		}
 		server, port, secret, perr := parseProxyURL(raw)
 		if perr != nil {
-			skipped++
 			continue
 		}
 		entries = append(entries, proxyEntry{
@@ -201,7 +201,7 @@ func readProxies(path string) (entries []proxyEntry, skipped int, err error) {
 			secret: secret,
 		})
 	}
-	return entries, skipped, scanner.Err()
+	return entries, scanner.Err()
 }
 
 func parseProxyURL(raw string) (server, port string, secret []byte, err error) {

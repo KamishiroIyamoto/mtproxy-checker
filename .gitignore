@@ -2,3 +2,4 @@ mtproxy
 *.exe
 .DS_Store
 *.log
+/.idea

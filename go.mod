@@ -2,7 +2,11 @@ module mtproxy-checker
 
 go 1.25.0
 
-require github.com/gotd/td v0.166.1
+require (
+	github.com/adrg/xdg v0.5.3
+	github.com/gotd/td v0.166.1
+	golang.org/x/term v0.45.0
+)
 
 require (
 	github.com/andybalholm/brotli v1.2.1 // indirect

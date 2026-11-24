@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-
 set -euo pipefail
 
 PURGE=0
+
 for arg in "$@"; do
     case "$arg" in
         --purge) PURGE=1 ;;
@@ -11,18 +11,19 @@ for arg in "$@"; do
 Usage: uninstall.sh [--purge]
 
 Removes:
-  - ~/.local/bin/mtproxy
+  - ~/.local/bin/mtproxy (wrapper)
   - the mtproxy binary inside the project directory
   - downloaded proxy lists in the Downloads directory
 
 Options:
   --purge   also delete the entire project directory
 EOF
-            exit 0 ;;
+            exit 0
+            ;;
         *)
             echo "Unknown option: $arg" >&2
-            echo "Try: uninstall.sh --help" >&2
-            exit 1 ;;
+            exit 1
+            ;;
     esac
 done
 
@@ -54,7 +55,10 @@ done
 
 if [ "$PURGE" = "1" ]; then
     case "$SCRIPT_DIR" in
-        "$HOME"|"/"|"") echo "Refusing to delete $SCRIPT_DIR" >&2; exit 1 ;;
+        "$HOME"|"/"|"")
+            echo "Refusing to delete $SCRIPT_DIR" >&2
+            exit 1
+            ;;
     esac
     cd /
     rm -rf -- "$SCRIPT_DIR"
