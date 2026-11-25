@@ -8,6 +8,8 @@ REQUIRED_GO="1.27"
 FALLBACK_GO_VERSION="1.27.0"
 PROFILE_CHANGED=0
 
+have() { command -v "$1" >/dev/null 2>&1; }
+
 if have locale; then
     case "$(locale charmap 2>/dev/null)" in
         UTF-8|utf-8|UTF8|utf8) SUPPORTS_UTF8=1 ;;
@@ -27,7 +29,6 @@ fi
 
 log()  { echo "[install] $*" >&2; }
 die()  { echo "[install] $CROSS $*" >&2; exit 1; }
-have() { command -v "$1" >/dev/null 2>&1; }
 
 version_ge() {
     awk -v a="$1" -v b="$2" '
