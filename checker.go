@@ -31,7 +31,6 @@ func check(ctx context.Context, entries []proxyEntry, st *stats) <-chan checkRes
 	alive := make(chan proxyEntry, mtprotoWorkers)
 	results := make(chan checkResult)
 
-	// Producer.
 	go func() {
 		defer close(tcpJobs)
 		for _, e := range entries {

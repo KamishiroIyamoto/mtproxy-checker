@@ -8,11 +8,6 @@ REQUIRED_GO="1.27"
 FALLBACK_GO_VERSION="1.27.0"
 PROFILE_CHANGED=0
 
-log()  { echo "[install] $*" >&2; }
-warn() { echo "[install] $WARN $*" >&2; }
-die()  { echo "[install] $CROSS $*" >&2; exit 1; }
-have() { command -v "$1" >/dev/null 2>&1; }
-
 if have locale; then
     case "$(locale charmap 2>/dev/null)" in
         UTF-8|utf-8|UTF8|utf8) SUPPORTS_UTF8=1 ;;
@@ -25,11 +20,14 @@ else
     esac
 fi
 if [ "$SUPPORTS_UTF8" = "1" ] && [ "${TERM:-}" != "linux" ]; then
-    CHECK="✅"; CROSS="❌"; WARN="⚠️"; GEAR="🔧"; PARTY="🎉"
+    CHECK="✅"; CROSS="❌"; GEAR="🔧"; PARTY="🎉"
 else
-    CHECK="[OK]"; CROSS="[ERR]"; WARN="[!]"; GEAR="*"; PARTY="[OK]"
+    CHECK="[OK]"; CROSS="[ERR]"; GEAR="*"; PARTY="[OK]"
 fi
 
+log()  { echo "[install] $*" >&2; }
+die()  { echo "[install] $CROSS $*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
 
 version_ge() {
     awk -v a="$1" -v b="$2" '
@@ -73,7 +71,7 @@ ensure_downloader() {
         return 0
     fi
 
-    log "Neither curl nor wget found; attempting to install curl..."
+    log "$GEAR Neither curl nor wget found; attempting to install curl..."
 
     local pm=""
     if have apt-get; then
@@ -121,7 +119,7 @@ ensure_downloader() {
     if ! have curl; then
         die "curl installation failed. Please install curl or wget manually."
     fi
-    log "curl: installed"
+    log "$CHECK curl: installed"
 }
 
 fetch_text() {
@@ -167,7 +165,6 @@ install_go() {
             die "GO_INSTALL_VERSION=$version is too old - mtproxy needs Go ${REQUIRED_GO} or newer."
         fi
     else
-        log "Looking up the latest Go release..."
         version="$(latest_go_version)"
     fi
 
@@ -230,7 +227,7 @@ add_to_profile() {
     shell_name="$(basename "${SHELL:-bash}")"
 
     if [ -f "$profile" ] && grep -qF "$dir" "$profile" 2>/dev/null; then
-        log "$label: $dir is already on your PATH (in $profile)"
+        log "$CHECK $label: $dir is already on your PATH (in $profile)"
         return 1
     fi
 
@@ -245,7 +242,7 @@ add_to_profile() {
         fi
     } >> "$profile"
     PROFILE_CHANGED=1
-    log "$label: added $dir to your PATH (in $profile)"
+    log "$CHECK $label: added $dir to your PATH (in $profile)"
     return 0
 }
 
@@ -263,7 +260,7 @@ if have go; then
         GO_OK=1
         log "$CHECK Go $GO_VER found - using it"
     elif [ -n "$GO_VER" ]; then
-        log "Found Go $GO_VER, but ${REQUIRED_GO}+ is needed"
+        log "$GEAR Found Go $GO_VER, but ${REQUIRED_GO}+ is needed"
     fi
 fi
 
@@ -301,7 +298,7 @@ chmod +x "$BIN_DIR/mtproxy"
 
 if [ -f "$SCRIPT_DIR/mtproxy" ]; then
     rm -f -- "$SCRIPT_DIR/mtproxy"
-    log "Removed an old binary from the project folder (no longer needed)"
+    log "$GEAR Removed an old binary from the project folder (no longer needed)"
 fi
 
 add_to_profile "$BIN_DIR" "mtproxy" || true

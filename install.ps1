@@ -12,15 +12,14 @@ $RequiredGo        = [version]"1.27"
 $FallbackGoVersion = "1.27.0"
 
 $script:PathChanged = $false
-$check = "[OK]"; $cross = "[ERR]"; $warn = "[!]"; $gear = "*"; $party = "[OK]"
+$check = "[OK]"; $cross = "[ERR]"; $gear = "*"; $party = "[OK]"
 try {
     if ([Console]::OutputEncoding.WebName -match 'utf-?8') {
-        $check = "✅"; $cross = "❌"; $warn = "⚠️"; $gear = "🔧"; $party = "🎉"
+        $check = "✅"; $cross = "❌"; $gear = "🔧"; $party = "🎉"
     }
 } catch {}
 
 function Log($msg)  { Write-Host "[install] $msg" -ForegroundColor Cyan }
-function Warn($msg) { Write-Host "[install] $warn $msg" -ForegroundColor Yellow }
 function Fail($msg) { Write-Host "[install] $cross $msg" -ForegroundColor Red; exit 1 }
 
 function Get-GoVersion {
@@ -55,13 +54,13 @@ function Add-ToUserPath($dir) {
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
     $parts = if ($userPath) { $userPath -split ';' | Where-Object { $_ } } else { @() }
     if ($parts -contains $dir) {
-        Log "$dir is already on your PATH"
+        Log "$check $dir is already on your PATH"
         return
     }
     $newPath = if ($userPath) { "$userPath;$dir" } else { $dir }
     [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
     $script:PathChanged = $true
-    Log "Added $dir to your PATH"
+    Log "$check Added $dir to your PATH"
 }
 
 function Get-WindowsArch {
@@ -95,7 +94,6 @@ function Install-Go {
             Fail "GO_INSTALL_VERSION=$version doesn't look like a valid version (expected something like 1.27.0)."
         }
     } else {
-        Log "Looking up the latest Go release..."
         $version = Get-LatestGoVersion
     }
 
@@ -129,13 +127,13 @@ function Install-Go {
     Add-ToUserPath "$LocalGoDir\bin"
 }
 
-Log "Setting up mtproxy-checker..."
+Log "$gear Setting up mtproxy-checker..."
 
 $existing = Get-GoVersion
 if ($existing -and (Test-GoVersionOk)) {
     Log "$check Go $existing found - using it"
 } else {
-    if ($existing) { Log "Found Go $existing, but $RequiredGo+ is needed" }
+    if ($existing) { Log "$cross Found Go $existing, but $RequiredGo+ is needed" }
 
     if (Test-Path (Join-Path $LocalGoDir "bin\go.exe")) {
         $env:Path = "$LocalGoDir\bin;$env:Path"
@@ -163,7 +161,7 @@ if ($LASTEXITCODE -ne 0) { Fail "Build failed - see the errors above." }
 foreach ($legacy in @((Join-Path $BinDir "mtproxy.ps1"), (Join-Path $ScriptDir "mtproxy.exe"))) {
     if (Test-Path $legacy) {
         Remove-Item -Force $legacy
-        Log "Removed a leftover from an older version: $legacy"
+        Log "$gear Removed a leftover from an older version: $legacy"
     }
 }
 

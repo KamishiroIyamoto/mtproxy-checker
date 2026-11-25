@@ -66,7 +66,7 @@ Environment:
 func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	// После первого Ctrl+C возвращаем стандартное поведение: второй завершает сразу.
+
 	go func() { <-ctx.Done(); stop() }()
 
 	dir := storageDir()
