@@ -1,20 +1,27 @@
-# install.ps1
 $ErrorActionPreference = "Stop"
+$ProgressPreference    = "SilentlyContinue"
+try {
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+} catch {}
 
-$ScriptDir        = Split-Path -Parent $MyInvocation.MyCommand.Path
-$BinDir           = Join-Path $env:USERPROFILE "bin"
-$LocalGoDir       = Join-Path $env:USERPROFILE "go-sdk"
-$RequiredGo       = [version]"1.25"
-$GoInstallVersion = if ($env:GO_INSTALL_VERSION) { $env:GO_INSTALL_VERSION } else { "1.25.0" }
+$ScriptDir         = Split-Path -Parent $MyInvocation.MyCommand.Path
+$BinDir            = Join-Path $env:USERPROFILE "bin"
+$LocalGoDir        = Join-Path $env:USERPROFILE "go-sdk"
+$RequiredGo        = [version]"1.27"
+$FallbackGoVersion = "1.27.0"
 
 $script:PathChanged = $false
-$check = "[OK]"; $cross = "[ERR]"
+$check = "[OK]"; $cross = "[ERR]"; $warn = "[!]"; $gear = "*"; $party = "[OK]"
 try {
-    if ([Console]::OutputEncoding.WebName -match 'utf-?8') { $check = "✅"; $cross = "❌" }
+    if ([Console]::OutputEncoding.WebName -match 'utf-?8') {
+        $check = "✅"; $cross = "❌"; $warn = "⚠️"; $gear = "🔧"; $party = "🎉"
+    }
 } catch {}
 
 function Log($msg)  { Write-Host "[install] $msg" -ForegroundColor Cyan }
-function Fail($msg) { Write-Error "[install] $cross $msg"; exit 1 }
+function Warn($msg) { Write-Host "[install] $warn $msg" -ForegroundColor Yellow }
+function Fail($msg) { Write-Host "[install] $cross $msg" -ForegroundColor Red; exit 1 }
 
 function Get-GoVersion {
     try {
@@ -22,7 +29,8 @@ function Get-GoVersion {
         if (-not $cmd) { return $null }
         $out = & $cmd.Source env GOVERSION 2>$null
         if ($LASTEXITCODE -ne 0) { return $null }
-        return ($out -replace '^go', '')
+        $line = ($out | Select-Object -First 1)
+        return (($line -replace '^go', '') -replace '\s.*$', '')
     } catch { return $null }
 }
 
@@ -32,17 +40,28 @@ function Test-GoVersionOk {
     try { return ([version]$v -ge $RequiredGo) } catch { return $false }
 }
 
+function Get-LatestGoVersion {
+    try {
+        $resp = Invoke-WebRequest -Uri "https://go.dev/VERSION?m=text" -UseBasicParsing -TimeoutSec 15
+        $text = $resp.Content
+        if ($text -is [byte[]]) { $text = [Text.Encoding]::UTF8.GetString($text) }
+        $first = (($text -split "`n")[0].Trim()) -replace '^go', ''
+        if ($first -match '^\d+\.\d+(\.\d+)?$') { return $first }
+    } catch {}
+    return $FallbackGoVersion
+}
+
 function Add-ToUserPath($dir) {
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
     $parts = if ($userPath) { $userPath -split ';' | Where-Object { $_ } } else { @() }
     if ($parts -contains $dir) {
-        Log "PATH already contains $dir"
+        Log "$dir is already on your PATH"
         return
     }
     $newPath = if ($userPath) { "$userPath;$dir" } else { $dir }
     [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
     $script:PathChanged = $true
-    Log "Added $dir to user PATH"
+    Log "Added $dir to your PATH"
 }
 
 function Get-WindowsArch {
@@ -55,32 +74,50 @@ function Get-WindowsArch {
         }
     } catch {}
 
-    $envArch = $env:PROCESSOR_ARCHITECTURE
-    if (-not $envArch) { $envArch = $env:PROCESSOR_ARCHITEW6432 }
+    $envArch = $env:PROCESSOR_ARCHITEW6432
+    if (-not $envArch) { $envArch = $env:PROCESSOR_ARCHITECTURE }
     switch ($envArch) {
         'AMD64' { return "amd64" }
         'ARM64' { return "arm64" }
         'x86'   { return "386" }
-        default { Fail "Unsupported architecture: $envArch" }
+        default { Fail "Sorry, the $envArch architecture isn't supported." }
     }
 }
 
 function Install-Go {
-    $arch = Get-WindowsArch
-    $zipName = "go$GoInstallVersion.windows-$arch.zip"
+    if ($env:GO_INSTALL_VERSION) {
+        $version = $env:GO_INSTALL_VERSION
+        try {
+            if ([version]$version -lt $RequiredGo) {
+                Fail "GO_INSTALL_VERSION=$version is too old - mtproxy needs Go $RequiredGo or newer."
+            }
+        } catch {
+            Fail "GO_INSTALL_VERSION=$version doesn't look like a valid version (expected something like 1.27.0)."
+        }
+    } else {
+        Log "Looking up the latest Go release..."
+        $version = Get-LatestGoVersion
+    }
+
+    $arch    = Get-WindowsArch
+    $zipName = "go$version.windows-$arch.zip"
     $url     = "https://go.dev/dl/$zipName"
     $tmp     = Join-Path $env:TEMP ("go-dl-" + [Guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 
     try {
-        Log "Downloading Go $GoInstallVersion from $url"
+        Log "$gear Downloading Go $version (around 70 MB, this may take a minute)..."
         $zipPath = Join-Path $tmp $zipName
-        Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing
+        try {
+            Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing
+        } catch {
+            Fail "Couldn't download $url - check your internet connection and try again."
+        }
 
-        Log "Extracting to $LocalGoDir"
+        Log "$gear Unpacking to $LocalGoDir..."
         Expand-Archive -Path $zipPath -DestinationPath $tmp -Force
         $extractedGo = Join-Path $tmp "go"
-        if (-not (Test-Path $extractedGo)) { Fail "Unexpected archive layout in $zipName" }
+        if (-not (Test-Path $extractedGo)) { Fail "Unexpected archive layout in $zipName." }
 
         if (Test-Path $LocalGoDir) { Remove-Item -Recurse -Force $LocalGoDir }
         Move-Item $extractedGo $LocalGoDir
@@ -92,40 +129,52 @@ function Install-Go {
     Add-ToUserPath "$LocalGoDir\bin"
 }
 
-if (-not (Test-GoVersionOk) -and (Test-Path (Join-Path $LocalGoDir "bin\go.exe"))) {
-    $env:Path = "$LocalGoDir\bin;$env:Path"
-}
+Log "Setting up mtproxy-checker..."
 
-if (-not (Test-GoVersionOk)) {
-    Log "Go not found or too old, installing..."
-    Install-Go
-    if (-not (Test-GoVersionOk)) { Fail "Go install failed" }
-}
+$existing = Get-GoVersion
+if ($existing -and (Test-GoVersionOk)) {
+    Log "$check Go $existing found - using it"
+} else {
+    if ($existing) { Log "Found Go $existing, but $RequiredGo+ is needed" }
 
-Log "Using Go $(Get-GoVersion)"
+    if (Test-Path (Join-Path $LocalGoDir "bin\go.exe")) {
+        $env:Path = "$LocalGoDir\bin;$env:Path"
+    }
+
+    if (Test-GoVersionOk) {
+        Log "$check Go $(Get-GoVersion) found in $LocalGoDir - using it"
+    } else {
+        Install-Go
+        if (-not (Test-GoVersionOk)) { Fail "Go install failed - please try again." }
+        Log "$check Go $(Get-GoVersion) installed to $LocalGoDir"
+    }
+}
 
 Set-Location $ScriptDir
-Log "Fetching dependencies (go mod tidy)..."
+Log "$gear Fetching dependencies..."
 & go mod tidy
-if ($LASTEXITCODE -ne 0) { Fail "go mod tidy failed" }
-
-Log "Building mtproxy.exe..."
-& go build -o "$ScriptDir\mtproxy.exe" .
-if ($LASTEXITCODE -ne 0) { Fail "go build failed" }
+if ($LASTEXITCODE -ne 0) { Fail "Couldn't fetch dependencies - check your internet connection and try again." }
 
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
-$wrapperContent = (Get-Content "$ScriptDir\mtproxy.ps1" -Raw).Replace('__MTPROXY_BIN__', "$ScriptDir\mtproxy.exe")
-Set-Content -Path "$BinDir\mtproxy.ps1" -Value $wrapperContent -Encoding UTF8
+Log "$gear Building mtproxy..."
+& go build -trimpath -ldflags "-s -w" -o "$BinDir\mtproxy.exe" .
+if ($LASTEXITCODE -ne 0) { Fail "Build failed - see the errors above." }
+
+foreach ($legacy in @((Join-Path $BinDir "mtproxy.ps1"), (Join-Path $ScriptDir "mtproxy.exe"))) {
+    if (Test-Path $legacy) {
+        Remove-Item -Force $legacy
+        Log "Removed a leftover from an older version: $legacy"
+    }
+}
+
 Add-ToUserPath $BinDir
 
 Log ""
-Log "$check All set!"
-Log "  binary:  $ScriptDir\mtproxy.exe"
-Log "  wrapper: $BinDir\mtproxy.ps1"
+Log "$party All set! mtproxy is installed at $BinDir\mtproxy.exe"
 Log ""
 
 if ($script:PathChanged) {
-    Log "$check Done! Restart your terminal to pick up the new PATH, then run 'mtproxy' from anywhere."
+    Log "$check Restart your terminal, then type 'mtproxy' from any folder."
 } else {
-    Log "$check Done! '$BinDir' is already on your user PATH. Run 'mtproxy' from anywhere."
+    Log "$check Just type 'mtproxy' from any folder."
 }

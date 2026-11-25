@@ -1,270 +1,197 @@
 package main
 
 import (
-	"bufio"
+	"cmp"
 	"context"
-	"encoding/base64"
-	"encoding/hex"
+	"errors"
+	"flag"
 	"fmt"
-	"net"
-	"net/url"
+	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
-	"strings"
+	"slices"
 	"sync"
-	"sync/atomic"
+	"syscall"
 	"time"
-
-	"github.com/adrg/xdg"
-	"github.com/gotd/td/telegram"
-	"github.com/gotd/td/telegram/dcs"
-	"golang.org/x/term"
 )
-
-const (
-	workers = 30
-	timeout = 10 * time.Second
-)
-
-func downloadsDir() string {
-	if dir := xdg.UserDirs.Download; dir != "" {
-		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
-			return dir
-		}
-	}
-
-	if home, err := os.UserHomeDir(); err == nil {
-		return filepath.Join(home, "Downloads")
-	}
-	return "."
-}
-
-type proxyEntry struct {
-	raw    string
-	addr   string
-	secret []byte
-}
-
-type result struct {
-	entry proxyEntry
-	ok    bool
-}
 
 func main() {
-	dir := downloadsDir()
-	inputFile := filepath.Join(dir, "all_proxies.txt")
-	outputFile := filepath.Join(dir, "available_proxies.txt")
+	flag.Usage = usage
+	cleanOnly := flag.Bool("clean", false, "")
+	flag.Parse()
 
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating %s: %v\n", dir, err)
-		os.Exit(1)
+	if flag.NArg() > 0 {
+		ui.fail(fmt.Errorf("unexpected argument %q", flag.Arg(0)))
+		flag.Usage()
+		os.Exit(2)
 	}
 
-	entries, err := readProxies(inputFile)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading %s: %v\n", inputFile, err)
+	var err error
+	if *cleanOnly {
+		err = cleanDataFiles()
+	} else {
+		err = run()
+	}
+
+	switch {
+	case err == nil:
+	case errors.Is(err, context.Canceled):
+		ui.say(ui.icons.Stop, "Cancelled - nothing was checked.")
+		os.Exit(130)
+	default:
+		ui.fail(err)
 		os.Exit(1)
+	}
+}
+
+func usage() {
+	w := flag.CommandLine.Output()
+	fmt.Fprintf(w, `Usage: mtproxy [--clean]
+
+Downloads a fresh MTProto proxy list, checks every proxy and prints
+the working ones, fastest first.
+
+Options:
+  --clean     delete %s and %s, then exit
+  -h, --help  show this help
+
+Files are kept in: %s
+
+Environment:
+  MTPROXY_EMOJI=0|1   force plain-text or emoji output
+`, inputFileName, outputFileName, storageDir())
+}
+
+func run() error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	// После первого Ctrl+C возвращаем стандартное поведение: второй завершает сразу.
+	go func() { <-ctx.Done(); stop() }()
+
+	dir := storageDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("can't create folder %s: %w", dir, err)
+	}
+	inputFile := filepath.Join(dir, inputFileName)
+	outputFile := filepath.Join(dir, outputFileName)
+
+	ui.say(ui.icons.Download, "Downloading a fresh proxy list...")
+	if err := downloadProxyList(ctx, inputFile); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		fi, statErr := os.Stat(inputFile)
+		if statErr != nil {
+			return fmt.Errorf("couldn't download the proxy list (%v) - check your internet connection and try again", err)
+		}
+		ui.say(ui.icons.Warn, "Couldn't download a fresh list: %v", err)
+		ui.say(ui.icons.Info, "Falling back to the copy saved %s ago", humanAge(time.Since(fi.ModTime())))
+	}
+
+	entries, dupes, err := readProxies(inputFile)
+	if err != nil {
+		return fmt.Errorf("couldn't read %s: %w", inputFile, err)
 	}
 	if len(entries) == 0 {
-		fmt.Fprintf(os.Stderr, "No proxies to check in %s\n", inputFile)
-		os.Exit(1)
+		return fmt.Errorf("no usable proxies in %s - the list looks empty or malformed", inputFile)
 	}
 
-	out, err := os.OpenFile(outputFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error opening %s: %v\n", outputFile, err)
-		os.Exit(1)
+	msg := fmt.Sprintf("Got %s to check", count(len(entries), "proxy", "proxies"))
+	if dupes > 0 {
+		msg += fmt.Sprintf(" (skipped %s)", count(dupes, "duplicate", "duplicates"))
 	}
+	ui.say(ui.icons.List, "%s", msg)
+	ui.say(ui.icons.Check, "Checking them now - this usually takes under a minute. Press Ctrl+C to stop early.")
 
-	defer func() {
-		if cerr := out.Close(); cerr != nil {
-			fmt.Fprintf(os.Stderr, "Error closing %s: %v\n", outputFile, cerr)
-		}
-	}()
+	st := &stats{total: int64(len(entries))}
+	start := time.Now()
 
-	total := len(entries)
-	var processed, working int64
 	done := make(chan struct{})
-
 	var progressWG sync.WaitGroup
-	progressWG.Add(1)
-	go func() {
-		defer progressWG.Done()
-		renderProgress(total, &processed, &working, done)
-	}()
+	progressWG.Go(func() { renderProgress(st, start, done) })
 
-	jobs := make(chan proxyEntry)
-	results := make(chan result)
-
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for e := range jobs {
-				results <- result{entry: e, ok: checkProxy(e)}
-			}
-		}()
-	}
-
-	go func() {
-		for _, e := range entries {
-			jobs <- e
-		}
-		close(jobs)
-	}()
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	writer := bufio.NewWriter(out)
-
-	var availableList []string
-	for r := range results {
-		atomic.AddInt64(&processed, 1)
-		if r.ok {
-			atomic.AddInt64(&working, 1)
-			availableList = append(availableList, r.entry.raw)
-
-			if _, werr := writer.WriteString(r.entry.raw + "\n"); werr != nil {
-				fmt.Fprintf(os.Stderr, "Error writing output: %v\n", werr)
-			}
-		}
-	}
-
-	if err := writer.Flush(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error flushing output: %v\n", err)
+	var working []checkResult
+	for r := range check(ctx, entries, st) {
+		working = append(working, r)
 	}
 
 	close(done)
 	progressWG.Wait()
 
-	fmt.Println("Working proxies:")
-	for _, p := range availableList {
-		fmt.Println(p)
-	}
-}
+	elapsed := time.Since(start).Round(100 * time.Millisecond)
+	interrupted := ctx.Err() != nil
 
-func renderProgress(total int, processed, working *int64, done <-chan struct{}) {
-	if !term.IsTerminal(int(os.Stderr.Fd())) {
-		<-done
-		return
-	}
-
-	frames := []rune("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	i := 0
-	for {
-		select {
-		case <-done:
-			fmt.Fprint(os.Stderr, "\r\033[K")
-			return
-		case <-ticker.C:
-			p := atomic.LoadInt64(processed)
-			w := atomic.LoadInt64(working)
-			remaining := int64(total) - p
-			fmt.Fprintf(os.Stderr, "\r\033[K%c Checked: %d/%d | Working: %d | Remaining: %d",
-				frames[i%len(frames)], p, total, w, remaining)
-			i++
-		}
-	}
-}
-
-func readProxies(path string) (entries []proxyEntry, err error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if cerr := f.Close(); cerr != nil && err == nil {
-			err = cerr
-		}
-	}()
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		raw := strings.TrimSpace(scanner.Text())
-		if raw == "" || strings.HasPrefix(raw, "#") {
-			continue
-		}
-		server, port, secret, perr := parseProxyURL(raw)
-		if perr != nil {
-			continue
-		}
-		entries = append(entries, proxyEntry{
-			raw:    raw,
-			addr:   net.JoinHostPort(server, port),
-			secret: secret,
-		})
-	}
-	return entries, scanner.Err()
-}
-
-func parseProxyURL(raw string) (server, port string, secret []byte, err error) {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "", "", nil, err
-	}
-	q := u.Query()
-	server = q.Get("server")
-	port = q.Get("port")
-	if server == "" || port == "" {
-		return "", "", nil, fmt.Errorf("missing server or port")
-	}
-	secret, err = decodeSecret(q.Get("secret"))
-	if err != nil {
-		return "", "", nil, err
-	}
-	return server, port, secret, nil
-}
-
-func decodeSecret(s string) ([]byte, error) {
-	if b, err := hex.DecodeString(s); err == nil {
-		return b, nil
-	}
-	if b, err := base64.RawURLEncoding.DecodeString(s); err == nil {
-		return b, nil
-	}
-	if b, err := base64.URLEncoding.DecodeString(s); err == nil {
-		return b, nil
-	}
-	return nil, fmt.Errorf("invalid secret")
-}
-
-func checkProxy(e proxyEntry) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	done := make(chan bool, 1)
-	go func() {
-		done <- runCheck(ctx, e)
-	}()
-
-	select {
-	case ok := <-done:
-		return ok
-	case <-ctx.Done():
-		return false
-	}
-}
-
-func runCheck(ctx context.Context, e proxyEntry) bool {
-	resolver, err := dcs.MTProxy(e.addr, e.secret, dcs.MTProxyOptions{})
-	if err != nil {
-		return false
-	}
-
-	client := telegram.NewClient(telegram.TestAppID, telegram.TestAppHash, telegram.Options{
-		Resolver: resolver,
+	slices.SortFunc(working, func(a, b checkResult) int {
+		return cmp.Compare(a.latency, b.latency)
 	})
 
-	err = client.Run(ctx, func(ctx context.Context) error {
-		_, err := client.API().HelpGetNearestDC(ctx)
+	if len(working) == 0 {
+		if interrupted {
+			ui.say(ui.icons.Stop, "Stopped after %s - no working proxies found yet. Previous results were left untouched.", elapsed)
+			return nil
+		}
+		if err := saveResults(outputFile, nil); err != nil {
+			return err
+		}
+		ui.say(ui.icons.Empty, "No working proxies this time (%s checked in %s).",
+			count(len(entries), "proxy", "proxies"), elapsed)
+		ui.say(ui.icons.Info, "Public lists change often - try again in a while.")
+		return nil
+	}
+
+	if err := saveResults(outputFile, working); err != nil {
 		return err
+	}
+
+	found := count(len(working), "working proxy", "working proxies")
+	if interrupted {
+		ui.say(ui.icons.Stop, "Stopped early after %s - kept the %s found so far.", elapsed, found)
+	} else {
+		ui.say(ui.icons.Party, "Done in %s: %s out of %d!", elapsed, found, len(entries))
+	}
+	ui.say(ui.icons.Fast, "Fastest one answered in %s", working[0].latency.Round(time.Millisecond))
+	ui.say(ui.icons.Save, "Saved to %s", outputFile)
+
+	fmt.Fprintln(os.Stderr)
+	ui.say(ui.icons.OK, "Working proxies, fastest first:")
+	for _, r := range working {
+		fmt.Println(r.entry.raw)
+	}
+	return nil
+}
+
+func saveResults(path string, working []checkResult) error {
+	err := writeFileAtomic(path, func(w io.Writer) error {
+		for _, r := range working {
+			if _, err := fmt.Fprintln(w, r.entry.raw); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
-	return err == nil
+	if err != nil {
+		return fmt.Errorf("couldn't save results to %s: %w", path, err)
+	}
+	return nil
+}
+
+func count(n int, one, many string) string {
+	if n == 1 {
+		return "1 " + one
+	}
+	return fmt.Sprintf("%d %s", n, many)
+}
+
+func humanAge(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return "less than a minute"
+	case d < time.Hour:
+		return count(int(d/time.Minute), "minute", "minutes")
+	case d < 48*time.Hour:
+		return count(int(d/time.Hour), "hour", "hours")
+	default:
+		return count(int(d/(24*time.Hour)), "day", "days")
+	}
 }

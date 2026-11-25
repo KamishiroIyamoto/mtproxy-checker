@@ -1,4 +1,3 @@
-# uninstall.ps1
 param(
     [switch]$Purge
 )
@@ -6,36 +5,68 @@ param(
 $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$BinDir = Join-Path $env:USERPROFILE "bin"
-$Wrapper = Join-Path $BinDir "mtproxy.ps1"
-$Binary = Join-Path $ScriptDir "mtproxy.exe"
-$Downloads = [Environment]::GetFolderPath("UserProfile") + "\Downloads"
+$BinDir    = Join-Path $env:USERPROFILE "bin"
+$Installed = Join-Path $BinDir "mtproxy.exe"
+$Leftovers = @(
+    (Join-Path $BinDir "mtproxy.ps1"),
+    (Join-Path $ScriptDir "mtproxy.exe")
+)
 
-$removed = 0
+$ok = "[OK]"; $warn = "[!]"; $bin = "-"
+try {
+    if ([Console]::OutputEncoding.WebName -match 'utf-?8') { $ok = "✅"; $warn = "⚠️"; $bin = "🗑" }
+} catch {}
 
-foreach ($f in @($Wrapper, $Binary,
-    (Join-Path $Downloads "all_proxies.txt"),
-    (Join-Path $Downloads "available_proxies.txt"))) {
+function Find-Go {
+    $cmd = Get-Command go -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $local = Join-Path $env:USERPROFILE "go-sdk\bin\go.exe"
+    if (Test-Path $local) { return $local }
+    return $null
+}
+
+$cleaned = $false
+
+if (Test-Path $Installed) {
+    & $Installed --clean
+    if ($LASTEXITCODE -eq 0) { $cleaned = $true }
+}
+
+if (-not $cleaned) {
+    $go = Find-Go
+    if ($go -and (Test-Path (Join-Path $ScriptDir "go.mod"))) {
+        Write-Host "Building a temporary copy of mtproxy to find the proxy lists..." -ForegroundColor Gray
+        Push-Location $ScriptDir
+        try {
+            & $go run . --clean
+            if ($LASTEXITCODE -eq 0) { $cleaned = $true }
+        } finally {
+            Pop-Location
+        }
+    }
+}
+
+if (-not $cleaned) {
+    Write-Host "$warn Couldn't locate the proxy lists automatically." -ForegroundColor Yellow
+    Write-Host "   If you still have them, delete them from your Downloads folder by hand." -ForegroundColor Yellow
+}
+
+foreach ($f in @($Installed) + $Leftovers) {
     if (Test-Path $f) {
         Remove-Item -Force $f
-        Write-Host "Removed: $f" -ForegroundColor Yellow
-        $removed++
+        Write-Host "$bin Removed $f" -ForegroundColor Yellow
     }
 }
 
 if ($Purge) {
-    if ($ScriptDir -eq $env:USERPROFILE -or $ScriptDir -eq "C:\") {
-        Write-Error "Refusing to delete $ScriptDir"
+    $root = [IO.Path]::GetPathRoot($ScriptDir)
+    if ($ScriptDir -eq $env:USERPROFILE -or $ScriptDir.TrimEnd('\') -eq $root.TrimEnd('\')) {
+        Write-Host "$warn Refusing to delete $ScriptDir" -ForegroundColor Red
         exit 1
     }
-    Set-Location C:\
+    Set-Location $root
     Remove-Item -Recurse -Force $ScriptDir
-    Write-Host "Removed: $ScriptDir" -ForegroundColor Yellow
-    $removed++
+    Write-Host "$bin Removed $ScriptDir" -ForegroundColor Yellow
 }
 
-if ($removed -eq 0) {
-    Write-Host "Nothing to remove." -ForegroundColor Gray
-} else {
-    Write-Host "Uninstall complete." -ForegroundColor Green
-}
+Write-Host "$ok Uninstall complete. Thanks for using mtproxy-checker!" -ForegroundColor Green

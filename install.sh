@@ -4,11 +4,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
 LOCAL_GO_DIR="$HOME/.local/go"
-REQUIRED_GO="1.25"
-GO_INSTALL_VERSION="${GO_INSTALL_VERSION:-1.25.0}"
+REQUIRED_GO="1.27"
+FALLBACK_GO_VERSION="1.27.0"
 PROFILE_CHANGED=0
 
-if command -v locale >/dev/null 2>&1; then
+log()  { echo "[install] $*" >&2; }
+warn() { echo "[install] $WARN $*" >&2; }
+die()  { echo "[install] $CROSS $*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+if have locale; then
     case "$(locale charmap 2>/dev/null)" in
         UTF-8|utf-8|UTF8|utf8) SUPPORTS_UTF8=1 ;;
         *) SUPPORTS_UTF8=0 ;;
@@ -19,16 +24,12 @@ else
         *) SUPPORTS_UTF8=0 ;;
     esac
 fi
-if [ "$SUPPORTS_UTF8" = "1" ]; then
-    CHECK="✅"
-    CROSS="❌"
+if [ "$SUPPORTS_UTF8" = "1" ] && [ "${TERM:-}" != "linux" ]; then
+    CHECK="✅"; CROSS="❌"; WARN="⚠️"; GEAR="🔧"; PARTY="🎉"
 else
-    CHECK="[OK]"
-    CROSS="[ERR]"
+    CHECK="[OK]"; CROSS="[ERR]"; WARN="[!]"; GEAR="*"; PARTY="[OK]"
 fi
 
-log()  { echo "[install] $*" >&2; }
-die()  { echo "[install] $CROSS error: $*" >&2; exit 1; }
 
 version_ge() {
     awk -v a="$1" -v b="$2" '
@@ -50,7 +51,7 @@ detect_os() {
     case "$(uname -s)" in
         Linux*)  echo "linux" ;;
         Darwin*) echo "darwin" ;;
-        *)       die "Unsupported OS: $(uname -s)" ;;
+        *)       die "Sorry, $(uname -s) isn't supported. Supported systems: Linux, macOS, Windows." ;;
     esac
 }
 
@@ -58,34 +59,34 @@ detect_arch() {
     case "$(uname -m)" in
         x86_64|amd64)  echo "amd64" ;;
         arm64|aarch64) echo "arm64" ;;
-        *)             die "Unsupported architecture: $(uname -m)" ;;
+        *)             die "Sorry, the $(uname -m) architecture isn't supported (need x86_64 or arm64)." ;;
     esac
 }
 
 ensure_downloader() {
-    if command -v curl >/dev/null 2>&1; then
-        log "curl: found"
+    if have curl; then
+        log "$CHECK curl: found"
         return 0
     fi
-    if command -v wget >/dev/null 2>&1; then
-        log "wget: found (curl not present, will use wget)"
+    if have wget; then
+        log "$CHECK wget: found"
         return 0
     fi
 
     log "Neither curl nor wget found; attempting to install curl..."
 
     local pm=""
-    if command -v apt-get >/dev/null 2>&1; then
+    if have apt-get; then
         pm="apt-get"
-    elif command -v dnf >/dev/null 2>&1; then
+    elif have dnf; then
         pm="dnf"
-    elif command -v yum >/dev/null 2>&1; then
+    elif have yum; then
         pm="yum"
-    elif command -v pacman >/dev/null 2>&1; then
+    elif have pacman; then
         pm="pacman"
-    elif command -v apk >/dev/null 2>&1; then
+    elif have apk; then
         pm="apk"
-    elif command -v brew >/dev/null 2>&1; then
+    elif have brew; then
         pm="brew"
     fi
 
@@ -117,63 +118,75 @@ ensure_downloader() {
             ;;
     esac
 
-    if ! command -v curl >/dev/null 2>&1; then
+    if ! have curl; then
         die "curl installation failed. Please install curl or wget manually."
     fi
     log "curl: installed"
 }
 
-download() {
-    local url="$1" out="$2"
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --retry 3 -o "$out" "$url"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q -O "$out" "$url"
+fetch_text() {
+    if have curl; then
+        curl -fsSL --max-time 15 "$1"
+    elif have wget; then
+        wget -q -T 15 -O - "$1"
     else
-        die "Neither curl nor wget available; cannot download $url"
+        return 1
     fi
 }
 
-OS="$(detect_os)"
-ARCH="$(detect_arch)"
-
-ensure_downloader
-
-GO_OK=0
-if command -v go &>/dev/null; then
-    GO_VER="$(go env GOVERSION 2>/dev/null | sed 's/^go//' || true)"
-    if [ -n "$GO_VER" ] && version_ge "$GO_VER" "$REQUIRED_GO"; then
-        GO_OK=1
-        log "Found global Go $GO_VER"
+download_file() {
+    local url="$1" out="$2"
+    if have curl; then
+        curl -fsSL --retry 3 -o "$out" "$url"
+    elif have wget; then
+        wget -q -O "$out" "$url"
+    else
+        return 1
     fi
-fi
+}
 
-if [ "$GO_OK" = "0" ] && [ -x "$LOCAL_GO_DIR/bin/go" ]; then
-    export PATH="$LOCAL_GO_DIR/bin:$PATH"
-    GO_VER="$(go env GOVERSION 2>/dev/null | sed 's/^go//' || true)"
-    if [ -n "$GO_VER" ] && version_ge "$GO_VER" "$REQUIRED_GO"; then
-        GO_OK=1
-        log "Found local Go $GO_VER"
+latest_go_version() {
+    local v
+    v="$(fetch_text "https://go.dev/VERSION?m=text" 2>/dev/null | head -n 1 | sed 's/^go//' || true)"
+    if printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+        echo "$v"
+    else
+        echo "$FALLBACK_GO_VERSION"
     fi
-fi
+}
 
-if [ "$GO_OK" = "0" ]; then
-    log "Installing Go $GO_INSTALL_VERSION to $LOCAL_GO_DIR"
-    tarball="go${GO_INSTALL_VERSION}.${OS}-${ARCH}.tar.gz"
+go_version() {
+    "$1" env GOVERSION 2>/dev/null | sed -e 's/^go//' -e 's/[[:space:]].*$//' || true
+}
+
+install_go() {
+    local version tarball url tmp
+    if [ -n "${GO_INSTALL_VERSION:-}" ]; then
+        version="$GO_INSTALL_VERSION"
+        if ! version_ge "$version" "$REQUIRED_GO"; then
+            die "GO_INSTALL_VERSION=$version is too old - mtproxy needs Go ${REQUIRED_GO} or newer."
+        fi
+    else
+        log "Looking up the latest Go release..."
+        version="$(latest_go_version)"
+    fi
+
+    tarball="go${version}.${OS}-${ARCH}.tar.gz"
     url="https://go.dev/dl/${tarball}"
-    tmp="$(mktemp -d)"
-    if ! download "$url" "$tmp/$tarball"; then
-        rm -rf "$tmp"
-        die "Failed to download $url"
-    fi
+    log "$GEAR Downloading Go $version (around 70 MB, this may take a minute)..."
 
+    tmp="$(mktemp -d)"
+    if ! download_file "$url" "$tmp/$tarball"; then
+        rm -rf "$tmp"
+        die "Couldn't download $url - check your internet connection and try again."
+    fi
     if ! tar -C "$tmp" -xzf "$tmp/$tarball"; then
         rm -rf "$tmp"
-        die "Failed to extract $tarball"
+        die "Couldn't unpack $tarball - the download may be corrupted, please try again."
     fi
     if [ ! -d "$tmp/go" ]; then
         rm -rf "$tmp"
-        die "Unexpected archive layout in $tarball"
+        die "Unexpected archive layout in $tarball."
     fi
 
     mkdir -p "$(dirname "$LOCAL_GO_DIR")"
@@ -182,12 +195,12 @@ if [ "$GO_OK" = "0" ]; then
     rm -rf "$tmp"
 
     export PATH="$LOCAL_GO_DIR/bin:$PATH"
-    GO_VER="$(go env GOVERSION 2>/dev/null | sed 's/^go//' || true)"
+    GO_VER="$(go_version "$LOCAL_GO_DIR/bin/go")"
     if [ -z "$GO_VER" ] || ! version_ge "$GO_VER" "$REQUIRED_GO"; then
-        die "Go install failed: got ${GO_VER:-unknown}, need ${REQUIRED_GO}+"
+        die "Go install failed: got ${GO_VER:-unknown}, need ${REQUIRED_GO}+."
     fi
-    log "Installed Go $GO_VER"
-fi
+    log "$CHECK Go $GO_VER installed to $LOCAL_GO_DIR"
+}
 
 detect_profile() {
     local shell_name
@@ -217,7 +230,7 @@ add_to_profile() {
     shell_name="$(basename "${SHELL:-bash}")"
 
     if [ -f "$profile" ] && grep -qF "$dir" "$profile" 2>/dev/null; then
-        log "$label: $dir already present in $profile"
+        log "$label: $dir is already on your PATH (in $profile)"
         return 1
     fi
 
@@ -232,9 +245,40 @@ add_to_profile() {
         fi
     } >> "$profile"
     PROFILE_CHANGED=1
-    log "$label: added $dir to $profile"
+    log "$label: added $dir to your PATH (in $profile)"
     return 0
 }
+
+OS="$(detect_os)"
+ARCH="$(detect_arch)"
+
+ensure_downloader
+
+log "$GEAR Setting up mtproxy-checker..."
+
+GO_OK=0
+if have go; then
+    GO_VER="$(go_version go)"
+    if [ -n "$GO_VER" ] && version_ge "$GO_VER" "$REQUIRED_GO"; then
+        GO_OK=1
+        log "$CHECK Go $GO_VER found - using it"
+    elif [ -n "$GO_VER" ]; then
+        log "Found Go $GO_VER, but ${REQUIRED_GO}+ is needed"
+    fi
+fi
+
+if [ "$GO_OK" = "0" ] && [ -x "$LOCAL_GO_DIR/bin/go" ]; then
+    GO_VER="$(go_version "$LOCAL_GO_DIR/bin/go")"
+    if [ -n "$GO_VER" ] && version_ge "$GO_VER" "$REQUIRED_GO"; then
+        export PATH="$LOCAL_GO_DIR/bin:$PATH"
+        GO_OK=1
+        log "$CHECK Go $GO_VER found in $LOCAL_GO_DIR - using it"
+    fi
+fi
+
+if [ "$GO_OK" = "0" ]; then
+    install_go
+fi
 
 if [ -x "$LOCAL_GO_DIR/bin/go" ]; then
     case "$(command -v go || true)" in
@@ -243,31 +287,35 @@ if [ -x "$LOCAL_GO_DIR/bin/go" ]; then
 fi
 
 cd "$SCRIPT_DIR"
-log "Fetching dependencies (go mod tidy)..."
-GO111MODULE=on go mod tidy
-log "Building mtproxy..."
-if ! GO111MODULE=on go build -o "$SCRIPT_DIR/mtproxy" .; then
-    die "go build failed"
+log "$GEAR Fetching dependencies..."
+if ! go mod tidy; then
+    die "Couldn't fetch dependencies - check your internet connection and try again."
 fi
 
 mkdir -p "$BIN_DIR"
-cp "$SCRIPT_DIR/mtproxy.sh" "$BIN_DIR/mtproxy"
+log "$GEAR Building mtproxy..."
+if ! go build -trimpath -ldflags "-s -w" -o "$BIN_DIR/mtproxy" .; then
+    die "Build failed - see the errors above."
+fi
 chmod +x "$BIN_DIR/mtproxy"
+
+if [ -f "$SCRIPT_DIR/mtproxy" ]; then
+    rm -f -- "$SCRIPT_DIR/mtproxy"
+    log "Removed an old binary from the project folder (no longer needed)"
+fi
+
 add_to_profile "$BIN_DIR" "mtproxy" || true
 
 log ""
-log "$CHECK All set!"
-log "  binary:  $SCRIPT_DIR/mtproxy"
-log "  wrapper: $BIN_DIR/mtproxy"
+log "$PARTY All set! mtproxy is installed at $BIN_DIR/mtproxy"
 log ""
 
 if [ "$PROFILE_CHANGED" = "1" ]; then
-    log "$CHECK Done! Restart your terminal (or: source \"$(detect_profile)\") to pick up the new PATH."
-    log "Then run 'mtproxy' from anywhere."
+    log "$CHECK Restart your terminal (or run: source \"$(detect_profile)\"),"
+    log "   then type 'mtproxy' from any folder."
 elif echo ":$PATH:" | grep -qF ":$BIN_DIR:"; then
-    log "$CHECK Done! PATH is already active. Run 'mtproxy' from anywhere."
+    log "$CHECK Just type 'mtproxy' from any folder."
 else
-    log "$CHECK Done! PATH is already configured in $(detect_profile)."
-    log "If 'mtproxy' is not found in the current shell, run:"
-    log "  source \"$(detect_profile)\""
+    log "$CHECK PATH is already configured in $(detect_profile)."
+    log "   If 'mtproxy' isn't found in this terminal, run: source \"$(detect_profile)\""
 fi
