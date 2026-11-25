@@ -17,8 +17,18 @@ BIN="${MTPROXY_BIN:-$HOME/mtproxy-checker/mtproxy}"
 mkdir -p "$DOWNLOADS"
 
 echo "Downloading proxy list from $URL" >&2
-if ! curl -fsSL --max-time 60 -o "$INPUT" "$URL"; then
-    echo "Error: failed to download $URL" >&2
+if command -v curl >/dev/null 2>&1; then
+    if ! curl -fsSL --max-time 60 -o "$INPUT" "$URL"; then
+        echo "Error: failed to download $URL" >&2
+        exit 1
+    fi
+elif command -v wget >/dev/null 2>&1; then
+    if ! wget -q --timeout=60 -O "$INPUT" "$URL"; then
+        echo "Error: failed to download $URL" >&2
+        exit 1
+    fi
+else
+    echo "Error: neither curl nor wget found" >&2
     exit 1
 fi
 

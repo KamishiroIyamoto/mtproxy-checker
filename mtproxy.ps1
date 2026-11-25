@@ -9,7 +9,7 @@ if (-not (Test-Path $Downloads)) {
 }
 
 $InputFile = Join-Path $Downloads "all_proxies.txt"
-$BinPath = if ($env:MTPROXY_BIN) { $env:MTPROXY_BIN } else { Join-Path $PSScriptRoot "mtproxy.exe" }
+$BinPath = if ($env:MTPROXY_BIN) { $env:MTPROXY_BIN } else { "__MTPROXY_BIN__" }
 
 Write-Host "Downloading proxy list from $Url" -ForegroundColor Cyan
 try {
